@@ -1,209 +1,254 @@
-/**
- * @fileoverview タスク管理アプリ用 バックエンドAPI (v2: メンバー管理＆Slack連携追加)
- */
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Attera Tasks - SaaS Edition v2</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap');
+        body { font-family: 'Inter', 'Noto Sans JP', sans-serif; transition: background-color 0.3s; background-color: #455a64; }
+        
+        /* ユーザーごとのテーマカラー背景 */
+        body.theme-blue { background-color: #0079bf; }
+        body.theme-teal { background-color: #00897b; }
+        body.theme-purple { background-color: #8e24aa; }
+        body.theme-orange { background-color: #d84315; }
+        body.theme-gray { background-color: #455a64; }
 
-const CONFIG = {
-  SHEET_NAME_DB: 'TaskMaster',
-  SHEET_NAME_MEMBERS: 'Members',
-  TIMEZONE: 'Asia/Tokyo',
-  DATE_FORMAT: 'yyyy/MM/dd HH:mm:ss',
-  // ★ここにSlackのWebhook URLを貼り付けてください★
-  SLACK_WEBHOOK_URL: "" 
-};
+        .kanban-col::-webkit-scrollbar { width: 6px; }
+        .kanban-col::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 4px; }
+        .board-container::-webkit-scrollbar { height: 10px; }
+        .board-container::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.4); border-radius: 6px; }
 
-// ==========================================
-// API エンドポイント (GET: データの取得)
-// ==========================================
-function doGet(e) {
-  try {
-    const { tasks } = getDatabase_(CONFIG.SHEET_NAME_DB);
-    const { tasks: members } = getDatabase_(CONFIG.SHEET_NAME_MEMBERS);
-    
-    return ContentService.createTextOutput(JSON.stringify({
-      status: 'success',
-      data: {
-        tasks: tasks,
-        members: members
-      }
-    })).setMimeType(ContentService.MimeType.JSON);
-    
-  } catch (error) {
-    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: error.toString() })).setMimeType(ContentService.MimeType.JSON);
-  }
-}
+        .task-card { transition: all 0.2s ease; }
+        .task-card:hover { border-color: #cbd5e1; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        .drag-handle { cursor: grab; color: #cbd5e1; }
+        .nav-item.active { background-color: rgba(255,255,255,0.1); border-left: 4px solid #fff; }
+        #loading-overlay { backdrop-filter: blur(4px); }
+    </style>
+</head>
+<body class="flex h-screen overflow-hidden text-gray-800 theme-gray" id="app-body">
 
-// ==========================================
-// API エンドポイント (POST: データの更新・追加)
-// ==========================================
-function doPost(e) {
-  try {
-    const payload = JSON.parse(e.postData.contents);
-    const action = payload.action;
-    let result = {};
+    <!-- Sidebar -->
+    <aside class="w-64 bg-gray-900 text-white flex flex-col shadow-xl z-20 flex-shrink-0">
+        <div class="p-4 border-b border-gray-800 flex items-center space-x-3">
+            <div class="bg-white/20 p-1.5 rounded-md"><i class="fas fa-check-double text-white text-lg"></i></div>
+            <h1 class="text-lg font-bold tracking-wider">Attera Tasks</h1>
+        </div>
+        
+        <div class="p-4 flex-1 overflow-y-auto">
+            <p class="text-[10px] text-gray-400 font-semibold uppercase tracking-wider mb-2">ワークスペース</p>
+            <nav class="space-y-1" id="user-nav">
+                <!-- メンバーリストがここに動的に生成される -->
+            </nav>
+            
+            <div class="mt-6 pt-4 border-t border-gray-800">
+                <button onclick="document.getElementById('member-modal').classList.remove('hidden')" class="w-full text-left text-gray-400 hover:text-white px-3 py-2 rounded-md transition text-sm flex items-center border border-dashed border-gray-700">
+                    <i class="fas fa-user-plus mr-1"></i><span>新規メンバーを追加</span>
+                </button>
+            </div>
+        </div>
+    </aside>
 
-    switch (action) {
-      case 'addTask':
-        result = addTask_(payload.data);
-        break;
-      case 'updateStatus':
-        result = updateTaskStatus_(payload.data.taskId, payload.data.newStatus);
-        break;
-      case 'updateTask':
-        result = updateTaskDetails_(payload.data);
-        break;
-      case 'addMember':
-        result = addMember_(payload.data);
-        break;
-      case 'sendSlack':
-        result = sendSlackNotification_(payload.data.userId);
-        break;
-      default:
-        throw new Error('不明なアクションです: ' + action);
-    }
+    <!-- Main Content -->
+    <main class="flex-1 flex flex-col h-full relative min-w-0">
+        <header class="bg-white/10 backdrop-blur-md px-5 py-2.5 flex justify-between items-center shadow-sm">
+            <h2 class="text-lg font-bold text-white tracking-wide" id="header-title">全体ダッシュボード</h2>
+            <div class="flex items-center space-x-3">
+                <button onclick="apiSendSlack()" class="text-xs px-3 py-1.5 bg-[#4A154B] hover:bg-[#611f69] text-white rounded transition shadow-sm font-medium">
+                    <i class="fab fa-slack mr-1"></i><span id="slack-btn-text">Slack通知</span>
+                </button>
+                <button onclick="fetchData()" class="text-xs px-3 py-1.5 bg-white/10 hover:bg-white/20 text-white rounded border border-white/20 transition font-medium">
+                    <i class="fas fa-sync-alt" id="sync-icon"></i><span> 同期</span>
+                </button>
+            </div>
+        </header>
 
-    return ContentService.createTextOutput(JSON.stringify({ status: 'success', result: result })).setMimeType(ContentService.MimeType.JSON);
+        <!-- Board Area -->
+        <div class="flex-1 overflow-x-auto board-container p-4 flex items-start space-x-3">
+            <!-- List: Today -->
+            <div class="bg-gray-100 rounded-lg w-[260px] flex-shrink-0 flex flex-col shadow-sm border border-gray-200">
+                <div class="px-3 py-2 border-b flex justify-between items-center bg-gray-100">
+                    <h3 class="font-bold text-gray-700 text-xs flex items-center"><span class="w-2 h-2 rounded-full bg-red-500 mr-1.5"></span>今日やる・超過</h3>
+                    <span class="bg-gray-200 text-gray-600 text-[10px] font-bold px-1.5 py-0.5 rounded" id="count-today">0</span>
+                </div>
+                <div id="list-today" class="p-1.5 flex-1 overflow-y-auto kanban-col min-h-[100px] space-y-1.5"></div>
+                <button onclick="openModal('today')" class="p-2 text-left text-gray-500 text-xs hover:bg-gray-200 border-t"><i class="fas fa-plus mr-1"></i>タスクを追加</button>
+            </div>
 
-  } catch (error) {
-    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: error.toString() })).setMimeType(ContentService.MimeType.JSON);
-  }
-}
+            <!-- List: Week -->
+            <div class="bg-gray-100 rounded-lg w-[260px] flex-shrink-0 flex flex-col shadow-sm border border-gray-200">
+                <div class="px-3 py-2 border-b flex justify-between items-center bg-gray-100">
+                    <h3 class="font-bold text-gray-700 text-xs flex items-center"><span class="w-2 h-2 rounded-full bg-blue-500 mr-1.5"></span>今週</h3>
+                    <span class="bg-gray-200 text-gray-600 text-[10px] font-bold px-1.5 py-0.5 rounded" id="count-week">0</span>
+                </div>
+                <div id="list-week" class="p-1.5 flex-1 overflow-y-auto kanban-col min-h-[100px] space-y-1.5"></div>
+                <button onclick="openModal('week')" class="p-2 text-left text-gray-500 text-xs hover:bg-gray-200 border-t"><i class="fas fa-plus mr-1"></i>タスクを追加</button>
+            </div>
 
-// ==========================================
-// コア・ロジック (内部処理)
-// ==========================================
+            <!-- List: Later -->
+            <div class="bg-gray-100 rounded-lg w-[260px] flex-shrink-0 flex flex-col shadow-sm border border-gray-200">
+                <div class="px-3 py-2 border-b flex justify-between items-center bg-gray-100">
+                    <h3 class="font-bold text-gray-700 text-xs flex items-center"><span class="w-2 h-2 rounded-full bg-gray-400 mr-1.5"></span>来週以降</h3>
+                    <span class="bg-gray-200 text-gray-600 text-[10px] font-bold px-1.5 py-0.5 rounded" id="count-later">0</span>
+                </div>
+                <div id="list-later" class="p-1.5 flex-1 overflow-y-auto kanban-col min-h-[100px] space-y-1.5"></div>
+                <button onclick="openModal('later')" class="p-2 text-left text-gray-500 text-xs hover:bg-gray-200 border-t"><i class="fas fa-plus mr-1.5"></i>タスクを追加</button>
+            </div>
 
-// 汎用データ取得関数
-function getDatabase_(sheetName) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
-  if (!sheet) throw new Error(`${sheetName} シートが存在しません。`);
+            <!-- List: Done -->
+            <div class="bg-gray-200/80 rounded-lg w-[260px] flex-shrink-0 flex flex-col shadow-sm border border-gray-300">
+                <div class="px-3 py-2 border-b border-gray-300 flex justify-between items-center bg-gray-200/80">
+                    <h3 class="font-bold text-gray-600 text-xs flex items-center"><i class="fas fa-check-circle text-green-600 mr-1.5"></i>完了 (本日)</h3>
+                    <span class="bg-gray-300 text-gray-600 text-[10px] font-bold px-1.5 py-0.5 rounded" id="count-done">0</span>
+                </div>
+                <div id="list-done" class="p-1.5 flex-1 overflow-y-auto kanban-col min-h-[100px] space-y-1.5"></div>
+            </div>
+        </div>
+    </main>
 
-  const data = sheet.getDataRange().getValues();
-  if (data.length <= 1) return { tasks: [], sheet, headers: data[0] || [] };
+    <!-- Modal: Task -->
+    <div id="task-modal" class="fixed inset-0 bg-gray-900/60 z-50 hidden flex items-center justify-center backdrop-blur-sm">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg p-6 space-y-4">
+            <input type="hidden" id="modal-task-id"><input type="hidden" id="modal-action-type">
+            <textarea id="modal-title" rows="2" class="w-full text-lg font-bold border rounded p-2 focus:ring-2 focus:ring-blue-500 outline-none" placeholder="タスク名"></textarea>
+            <div class="grid grid-cols-2 gap-4">
+                <div><label class="text-[10px] font-bold text-gray-500">担当者</label><select id="modal-user" class="w-full bg-gray-100 rounded p-2 text-sm outline-none"></select></div>
+                <div><label class="text-[10px] font-bold text-gray-500">期限</label><input type="date" id="modal-deadline" class="w-full bg-gray-100 rounded p-2 text-sm outline-none"></div>
+            </div>
+            <textarea id="modal-memo" rows="4" class="w-full text-sm border rounded-lg p-3 outline-none" placeholder="詳細メモ..."></textarea>
+            <div class="flex justify-end space-x-2">
+                <button onclick="document.getElementById('task-modal').classList.add('hidden')" class="px-4 py-2 text-xs font-medium text-gray-500">キャンセル</button>
+                <button id="btn-save-task" onclick="apiSaveTask()" class="px-4 py-2 text-xs font-medium bg-blue-600 text-white rounded shadow hover:bg-blue-700">保存する</button>
+            </div>
+        </div>
+    </div>
 
-  const headers = data[0];
-  const body = data.slice(1);
+    <!-- Modal: Member -->
+    <div id="member-modal" class="fixed inset-0 bg-gray-900/60 z-50 hidden flex items-center justify-center backdrop-blur-sm">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-sm p-6 space-y-4">
+            <h3 class="font-bold text-gray-800">メンバー追加</h3>
+            <input type="text" id="member-id" class="w-full border rounded p-2 text-sm" placeholder="ID (例: kiyonori)">
+            <input type="text" id="member-name" class="w-full border rounded p-2 text-sm" placeholder="表示名">
+            <select id="member-color" class="w-full border rounded p-2 text-sm">
+                <option value="blue">ブルー</option><option value="teal">ティール</option><option value="purple">パープル</option><option value="orange">オレンジ</option>
+            </select>
+            <div class="flex justify-end space-x-2">
+                <button onclick="document.getElementById('member-modal').classList.add('hidden')" class="px-4 py-2 text-xs">閉じる</button>
+                <button onclick="apiSaveMember()" class="px-4 py-2 text-xs bg-blue-600 text-white rounded">追加する</button>
+            </div>
+        </div>
+    </div>
 
-  const tasks = body.map(row => {
-    let obj = {};
-    headers.forEach((h, i) => {
-      if (row[i] instanceof Date) {
-        const d = row[i];
-        if(d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0) {
-            obj[h] = Utilities.formatDate(d, CONFIG.TIMEZONE, 'yyyy-MM-dd');
-        } else {
-            obj[h] = Utilities.formatDate(d, CONFIG.TIMEZONE, CONFIG.DATE_FORMAT);
+    <div id="loading-overlay" class="fixed inset-0 bg-gray-900/80 z-[100] flex flex-col items-center justify-center text-white">
+        <i class="fas fa-circle-notch fa-spin text-4xl text-blue-500 mb-4"></i><h2 class="text-xl font-bold tracking-widest">Attera Synchronizing...</h2>
+    </div>
+
+    <script>
+        const API_URL = 'https://script.google.com/macros/s/AKfycbwISYX7iYopoK2bSnDlDV474y2Ak7F4Gsy-2EFh5YLd59B-_Ob7Gd43RaOjU50AKVOjfA/exec';
+        let tasksDB = [], membersDB = [], currentUser = 'all';
+
+        async function fetchData() {
+            const icon = document.getElementById('sync-icon');
+            icon.classList.add('fa-spin');
+            document.getElementById('loading-overlay').classList.remove('hidden');
+            try {
+                const res = await fetch(API_URL);
+                const result = await res.json();
+                if(result.status === 'success') {
+                    tasksDB = result.data.tasks || [];
+                    membersDB = result.data.members || [];
+                    renderSidebar(); renderBoard();
+                }
+            } finally { 
+                icon.classList.remove('fa-spin');
+                document.getElementById('loading-overlay').classList.add('hidden'); 
+            }
         }
-      } else {
-        obj[h] = row[i];
-      }
-    });
-    return obj;
-  });
 
-  return { tasks, sheet, headers };
-}
+        function renderSidebar() {
+            const nav = document.getElementById('user-nav');
+            const select = document.getElementById('modal-user');
+            let navH = `<a href="#" onclick="switchUser('all','全体','gray')" class="nav-item ${currentUser==='all'?'active':''} flex items-center p-2 text-sm rounded hover:bg-gray-800"><i class="fas fa-globe mr-3 w-4"></i>全体表示</a>`;
+            let selH = '';
+            membersDB.forEach(m => {
+                navH += `<a href="#" onclick="switchUser('${m.User_ID}','${m.User_Name}','${m.Color}')" class="nav-item ${currentUser===m.User_ID?'active':''} flex items-center p-2 text-sm rounded hover:bg-gray-800 mb-1"><i class="fas fa-user mr-3 w-4"></i>${m.User_Name}</a>`;
+                selH += `<option value="${m.User_ID}">${m.User_Name}</option>`;
+            });
+            nav.innerHTML = navH; select.innerHTML = selH;
+        }
 
-// 新規メンバー追加
-function addMember_(memberData) {
-  const { sheet, headers } = getDatabase_(CONFIG.SHEET_NAME_MEMBERS);
-  const now = new Date();
-  
-  const newRow = headers.map(header => {
-    switch(header) {
-      case 'User_ID':   return memberData.userId;
-      case 'User_Name': return memberData.userName;
-      case 'Color':     return memberData.color || 'blue';
-      case 'Created_At':return now;
-      default:          return '';
-    }
-  });
+        function switchUser(id, name, color) {
+            currentUser = id; document.getElementById('header-title').innerText = id==='all'?'全体ダッシュボード':`${name} のボード`;
+            document.getElementById('app-body').className = `flex h-screen overflow-hidden theme-${color}`;
+            renderBoard();
+        }
 
-  sheet.appendRow(newRow);
-  return { message: 'メンバーを追加しました' };
-}
+        function renderBoard() {
+            const lists = { today: document.getElementById('list-today'), week: document.getElementById('list-week'), later: document.getElementById('list-later'), done: document.getElementById('list-done') };
+            Object.values(lists).forEach(l => l.innerHTML = '');
+            const filtered = currentUser === 'all' ? tasksDB : tasksDB.filter(t => t.User_ID === currentUser);
+            filtered.forEach(t => {
+                const isPast = t.Status !== 'done' && (t.Deadline < new Date().toISOString().split('T')[0]);
+                const borderClass = isPast ? 'border-l-4 border-red-500' : 'border-gray-200';
+                const html = `<div class="task-card bg-white p-2 rounded shadow-sm border ${borderClass} cursor-pointer group" data-task-id="${t.Task_ID}" onclick="openModal('edit','${t.Task_ID}',\`${t.Task_Name}\`,'${t.Deadline}','${t.User_ID}',\`${t.Memo||''}\`)">
+                    <div class="flex items-start">
+                        <div class="drag-handle mr-2"><i class="fas fa-grip-vertical text-[10px] text-gray-300"></i></div>
+                        <div class="flex-1 min-w-0">
+                            <h4 class="text-xs font-bold text-gray-800 break-words">${t.Task_Name}</h4>
+                            <div class="flex justify-between items-center mt-2">
+                                <span class="text-[9px] text-gray-400"><i class="far fa-clock mr-1"></i>${t.Deadline}</span>
+                                <span class="text-[9px] bg-gray-100 px-1 rounded">@${t.User_ID}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>`;
+                const target = lists[t.Status] || lists.later;
+                target.insertAdjacentHTML('beforeend', html);
+            });
+            ['today','week','later','done'].forEach(s => document.getElementById(`count-${s}`).innerText = document.getElementById(`list-${s}`).children.length);
+        }
 
-// Slack手動通知ロジック (役割: 抽出係 兼 POST係)
-function sendSlackNotification_(userId) {
-  if(!CONFIG.SLACK_WEBHOOK_URL) throw new Error("Slack Webhook URLが設定されていません。");
+        const sortOpts = { group: 'kanban', animation: 150, handle: '.drag-handle', onEnd: e => {
+            const taskId = e.item.dataset.taskId, newStatus = e.to.id.replace('list-','');
+            fetch(API_URL, { method: 'POST', body: JSON.stringify({ action: 'updateStatus', data: { taskId, newStatus } }) });
+        }};
+        ['today','week','later','done'].forEach(s => new Sortable(document.getElementById(`list-${s}`), sortOpts));
 
-  const { tasks } = getDatabase_(CONFIG.SHEET_NAME_DB);
-  const todayStr = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
-  
-  // 指定ユーザー(allの場合は全員)のタスクをフィルタリング
-  let targetTasks = tasks.filter(t => t.Status !== 'done');
-  if(userId !== 'all') {
-    targetTasks = targetTasks.filter(t => t.User_ID === userId);
-  }
+        async function apiSaveMember() {
+            const data = { userId: document.getElementById('member-id').value.trim(), userName: document.getElementById('member-name').value.trim(), color: document.getElementById('member-color').value };
+            if(!data.userId || !data.userName) return;
+            await fetch(API_URL, { method: 'POST', body: JSON.stringify({ action: 'addMember', data }) });
+            document.getElementById('member-modal').classList.add('hidden'); fetchData();
+        }
 
-  const pastDue = targetTasks.filter(t => t.Deadline < todayStr);
-  const todayTask = targetTasks.filter(t => t.Deadline === todayStr);
+        async function apiSendSlack() {
+            const btn = document.getElementById('slack-btn-text'); btn.innerText = '送信中...';
+            await fetch(API_URL, { method: 'POST', body: JSON.stringify({ action: 'sendSlack', data: { userId: currentUser } }) });
+            btn.innerText = 'Slack通知'; alert('Slackへ送信しました');
+        }
 
-  let msg = `*[手動通知] 現在のタスク状況 (${userId === 'all' ? '全体' : userId})*\n\n`;
-  
-  if(pastDue.length > 0) {
-    msg += `*🚨 期限超過*\n`;
-    pastDue.forEach(t => msg += `• <@${t.User_ID}>: ${t.Task_Name} (${t.Deadline})\n`);
-    msg += `\n`;
-  }
-  
-  if(todayTask.length > 0) {
-    msg += `*☀️ 本日やるべきタスク*\n`;
-    todayTask.forEach(t => msg += `• <@${t.User_ID}>: ${t.Task_Name}\n`);
-  } else {
-    msg += `※本日期限のタスクはありません。\n`;
-  }
+        async function apiSaveTask() {
+            const btn = document.getElementById('btn-save-task'); btn.disabled = true;
+            const data = { taskId: document.getElementById('modal-task-id').value, taskName: document.getElementById('modal-title').value, userId: document.getElementById('modal-user').value, deadline: document.getElementById('modal-deadline').value, memo: document.getElementById('modal-memo').value };
+            const action = document.getElementById('modal-action-type').value;
+            await fetch(API_URL, { method: 'POST', body: JSON.stringify({ action, data }) });
+            document.getElementById('task-modal').classList.add('hidden'); btn.disabled = false; fetchData();
+        }
 
-  const payload = { text: msg };
-  UrlFetchApp.fetch(CONFIG.SLACK_WEBHOOK_URL, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(payload)
-  });
-
-  return { message: 'Slackへ通知を送信しました。' };
-}
-
-// タスク追加
-function addTask_(taskData) {
-  const { sheet, headers } = getDatabase_(CONFIG.SHEET_NAME_DB);
-  const now = new Date();
-  const newTaskId = 'T-' + now.getTime();
-  const newRow = headers.map(header => {
-    switch(header) {
-      case 'Task_ID':   return newTaskId;
-      case 'Tenant_ID': return taskData.tenantId || 'CLI-001';
-      case 'User_ID':   return taskData.userId;
-      case 'Task_Name': return taskData.taskName;
-      case 'Deadline':  return taskData.deadline;
-      case 'Status':    return taskData.status || 'today';
-      case 'Memo':      return taskData.memo || '';
-      case 'Created_At':return now;
-      default:          return '';
-    }
-  });
-  sheet.appendRow(newRow);
-  return { message: 'タスクを追加しました', taskId: newTaskId };
-}
-
-// ステータス更新
-function updateTaskStatus_(taskId, newStatus) {
-  const { tasks, sheet, headers } = getDatabase_(CONFIG.SHEET_NAME_DB);
-  const targetIndex = tasks.findIndex(t => t.Task_ID === taskId);
-  if (targetIndex === -1) throw new Error('タスクが見つかりません');
-  const statusColIdx = headers.indexOf('Status') + 1;
-  sheet.getRange(targetIndex + 2, statusColIdx).setValue(newStatus);
-  return { message: '更新しました' };
-}
-
-// タスク更新
-function updateTaskDetails_(taskData) {
-  const { tasks, sheet, headers } = getDatabase_(CONFIG.SHEET_NAME_DB);
-  const targetIndex = tasks.findIndex(t => t.Task_ID === taskData.taskId);
-  if (targetIndex === -1) throw new Error('タスクが見つかりません');
-  const targetRowIdx = targetIndex + 2;
-  sheet.getRange(targetRowIdx, headers.indexOf('Task_Name') + 1).setValue(taskData.taskName);
-  sheet.getRange(targetRowIdx, headers.indexOf('User_ID') + 1).setValue(taskData.userId);
-  sheet.getRange(targetRowIdx, headers.indexOf('Deadline') + 1).setValue(taskData.deadline);
-  sheet.getRange(targetRowIdx, headers.indexOf('Memo') + 1).setValue(taskData.memo);
-  return { message: '更新しました' };
-}
+        function openModal(mode, id='', title='', date='', user='', memo='') {
+            document.getElementById('modal-task-id').value = id; document.getElementById('modal-title').value = title; 
+            document.getElementById('modal-deadline').value = date || new Date().toISOString().split('T')[0];
+            document.getElementById('modal-user').value = user || membersDB[0]?.User_ID || ''; 
+            document.getElementById('modal-memo').value = memo;
+            document.getElementById('modal-header-text').innerText = mode === 'edit' ? 'タスク編集' : '新規タスク登録';
+            document.getElementById('modal-action-type').value = mode === 'edit' ? 'updateTask' : 'addTask';
+            document.getElementById('task-modal').classList.remove('hidden');
+        }
+        window.onload = fetchData;
+    </script>
+</body>
+</html>
